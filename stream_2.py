@@ -4,15 +4,23 @@ import soxr
 from scipy import signal
 import matplotlib.pyplot as plt
 from fir_filter import create_fir_filter
-
-# === Audio Configuration ===
+# === Audio Configuration ===00000000000000000000
 SAMPLERATE = 44100
 UPSAMPLE_FACTOR = 2
 UPSAMPLE_RATE = SAMPLERATE * UPSAMPLE_FACTOR
-CHANNELS = 2  # Stereo
 BLOCKSIZE = 1024
-NUM_TAPS = 401  # Must be odd
-DEVICE = 'hw:0,0'  # Explicitly use HiFiBerry DAC
+NUM_TAPS = 401
+
+# Query devices and auto-detect proper channels
+devices = sd.query_devices()
+input_device = 3  # Your USB audio input index
+output_device = 0  # HiFiBerry DAC output index
+
+# Get actual supported channels
+input_channels = min(devices[input_device]['max_input_channels'], 2)
+output_channels = min(devices[output_device]['max_output_channels'], 2)
+
+print(f"Using {input_channels} input channels and {output_channels} output channels")
 
 # === Filter Configuration ===
 FILTER_TYPE = 'lowpass'
@@ -29,65 +37,60 @@ fir_coeff = create_fir_filter(
     samplerate=UPSAMPLE_RATE
 )
 
-# Plot configuration
-plt.figure()
-w, h = signal.freqz(fir_coeff, worN=8000, fs=UPSAMPLE_RATE)
-plt.plot(w, 20 * np.log10(np.abs(h)))
-plt.title('Filter Frequency Response')
-plt.ylabel('Magnitude (dB)')
-plt.xlabel('Frequency (Hz)')
-plt.grid(True)
-plt.show(block=False)
-
-# === Audio Buffers ===
+# Initialize buffers
 buffer_size = NUM_TAPS + (BLOCKSIZE * UPSAMPLE_FACTOR) - 1
-print(f"Buffer size per channel: {buffer_size}")
 left_buffer = np.zeros(buffer_size, dtype=np.float32)
 right_buffer = np.zeros(buffer_size, dtype=np.float32)
-
-def apply_dither(audio, bit_depth=24):
-    dither = (np.random.random(len(audio)) - 0.5) * (2 / (2**bit_depth))
-    return audio + dither
 
 def audio_callback(indata, outdata, frames, time, status):
     if status:
         print(f"Stream status: {status}")
+    
+    # Handle mono input if needed
+    if indata.ndim == 1 or indata.shape[1] == 1:
+        indata = np.column_stack((indata[:,0], indata[:,0]))
     
     # Process left channel
     upsampled_left = soxr.resample(indata[:, 0], SAMPLERATE, UPSAMPLE_RATE, quality='VHQ')
     left_buffer[:-len(upsampled_left)] = left_buffer[len(upsampled_left):]
     left_buffer[-len(upsampled_left):] = upsampled_left
     processed_left = signal.fftconvolve(left_buffer, fir_coeff, mode='valid')
-    outdata[:, 0] = apply_dither(processed_left[::UPSAMPLE_FACTOR][:frames])
+    outdata[:, 0] = processed_left[::UPSAMPLE_FACTOR][:frames]
     
-    # Process right channel
-    upsampled_right = soxr.resample(indata[:, 1], SAMPLERATE, UPSAMPLE_RATE, quality='VHQ')
-    right_buffer[:-len(upsampled_right)] = right_buffer[len(upsampled_right):]
-    right_buffer[-len(upsampled_right):] = upsampled_right
-    processed_right = signal.fftconvolve(right_buffer, fir_coeff, mode='valid')
-    outdata[:, 1] = apply_dither(processed_right[::UPSAMPLE_FACTOR][:frames])
+    # Process right channel if available, else duplicate left
+    if output_channels > 1:
+        if input_channels > 1:
+            upsampled_right = soxr.resample(indata[:, 1], SAMPLERATE, UPSAMPLE_RATE, quality='VHQ')
+            right_buffer[:-len(upsampled_right)] = right_buffer[len(upsampled_right):]
+            right_buffer[-len(upsampled_right):] = upsampled_right
+            processed_right = signal.fftconvolve(right_buffer, fir_coeff, mode='valid')
+            outdata[:, 1] = processed_right[::UPSAMPLE_FACTOR][:frames]
+        else:
+            outdata[:, 1] = outdata[:, 0]  # Duplicate mono to right channel
 
 if __name__ == "__main__":
-    print("Starting stereo DSP processing on HiFiBerry DAC...")
+    print("Starting audio processing...")
     
     try:
-        # Configure stream with explicit device
         with sd.Stream(
-            device=(DEVICE, DEVICE),  # Use same device for input/output
+            device=(input_device, output_device),
             samplerate=SAMPLERATE,
             blocksize=BLOCKSIZE,
-            channels=CHANNELS,
+            channels=(input_channels, output_channels),
             dtype='float32',
-            latency='high',
+            latency='low',
             callback=audio_callback,
-            extra_settings={'number_of_input_channels': 0}  # Force output-only mode
+            extra_settings={'dither_off': True}
         ):
-            print("Stream started successfully")
+            print("Stream active - processing audio")
+            print("Press Ctrl+C to stop")
             while True:
                 sd.sleep(1000)
+    except KeyboardInterrupt:
+        print("\nStopped by user")
     except Exception as e:
         print(f"Error: {e}")
-        print("\nAdditional troubleshooting:")
-        print("1. Run 'sudo raspi-config' and ensure audio is set to HiFiBerry")
-        print("2. Check '/boot/config.txt' for correct dtoverlay=hifiberry-dac")
-        print("3. Test with 'aplay -D hw:0,0 /usr/share/sounds/alsa/Front_Center.wav'")
+        print("\nTroubleshooting:")
+        print(f"1. Verify input device {input_device} supports at least 1 channel")
+        print(f"2. Verify output device {output_device} supports stereo")
+        print("3. Try setting channels=(1,2) if your input is mono")
