@@ -1,2 +1,3 @@
 # Audio-DSP-FIR
-project to develope profesional DAC
+project to develope profesional DAC by Rpi5
+
